@@ -39,6 +39,12 @@ Drug encoder: SMILES Transformer
 Protein encoder: GVP-GNN over protein structure graphs
 Fusion: multi-head cross-attention from drug embedding to protein embeddings (plus gene presence mask)
 Data loading: SmartMemoryDataset caches unique isolate graphs in RAM to reduce repeated I/O
+The training objective and schedule follow the configuration reported in the paper
+(Supplementary Table S2): focal loss with positive-class weighting, the AdamW
+optimizer with a cosine learning-rate schedule and linear warm-up, and early
+stopping / checkpoint selection on validation AUROC. These are the defaults;
+plain BCE and a constant learning rate remain available via flags.
+
 ### Run
 ```bash
 python train.py \
@@ -48,8 +54,11 @@ python train.py \
   --n_genes 333 \
   --out_dir /path/to/output \
   --batch_size 32 \
-  --epochs 50 \
+  --epochs 200 \
   --lr 1e-4 \
+  --loss_type focal --focal_gamma 2.0 --pos_weight auto \
+  --lr_schedule cosine --warmup_epochs 5 \
+  --best_metric auroc --patience 30 \
   --load_to_ram
 ```
 
@@ -76,6 +85,35 @@ python interpretability.py \
   --top_proteins 10
 ```
 
+## Generalization Splits (stringent evaluation)
+
+Two scripts build the stringent train/test splits used to test generalization
+beyond random isolate splits (Supplementary Table S3). Both emit manifests in the
+same schema as the random splits, which are then trained/evaluated with `train.py`.
+
+**`build_lineage_split_patric.py`** — lineage-aware split of PATRIC. Isolate
+similarity is estimated from whole-genome unitig presence/absence (pyseer format),
+isolates are clustered by Jaccard distance, and the most genomically distinct
+clusters are assigned to the test set, so entire lineages (not just repeated
+isolates) are held out.
+
+```bash
+python build_lineage_split_patric.py \
+  --patric_manifest /path/to/patric_manifest.parquet \
+  --unitig /path/to/unitig_caller.pyseer.gz \
+  --out_dir /path/to/splits
+```
+
+**`build_species_split_antibiogram.py`** — leave-species-out split of the
+multi-species Antibiogram cohort. Whole bacterial species are held out for test,
+so test species are never seen during training.
+
+```bash
+python build_species_split_antibiogram.py \
+  --antibiogram_manifest /path/to/antibiogram_manifest.parquet \
+  --out_dir /path/to/splits
+```
+
 ## What Each File Does
 hotspot_detection.py
 ConservationCalculator: loads MSA and computes entropy-based conservation scores
@@ -93,3 +131,10 @@ Captures drug self-attention (layer/head selectable) and exports token importanc
 Computes drug→protein cross-attention for protein ranking
 Builds node→PDB residue mapping CSV and exports hotspot residue tables
 Writes a PyMOL script (.pml) for hotspot visualization
+
+build_lineage_split_patric.py
+Builds the lineage-aware PATRIC split from whole-genome unitig profiles
+(Jaccard clustering; most-distinct clusters held out for test)
+
+build_species_split_antibiogram.py
+Builds the leave-species-out Antibiogram split (whole species held out for test)
