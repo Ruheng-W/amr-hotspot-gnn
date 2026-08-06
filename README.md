@@ -40,10 +40,11 @@ Protein encoder: GVP-GNN over protein structure graphs
 Fusion: multi-head cross-attention from drug embedding to protein embeddings (plus gene presence mask)
 Data loading: SmartMemoryDataset caches unique isolate graphs in RAM to reduce repeated I/O
 The training objective and schedule follow the configuration reported in the paper
-(Supplementary Table S2): focal loss with positive-class weighting, the AdamW
-optimizer with a cosine learning-rate schedule and linear warm-up, and early
-stopping / checkpoint selection on validation AUROC. These are the defaults;
-plain BCE and a constant learning rate remain available via flags.
+(Supplementary Table S2): binary cross-entropy with positive-class weighting (the
+default), the AdamW optimizer with a cosine learning-rate schedule and linear
+warm-up, and early stopping / checkpoint selection on validation AUROC. A
+focal-loss variant (used for the leave-one-drug-out retrains) is available via
+`--loss_type focal`.
 
 ### Run
 ```bash
@@ -56,7 +57,7 @@ python train.py \
   --batch_size 32 \
   --epochs 200 \
   --lr 1e-4 \
-  --loss_type focal --focal_gamma 2.0 --pos_weight auto \
+  --loss_type bce --pos_weight auto \
   --lr_schedule cosine --warmup_epochs 5 \
   --best_metric auroc --patience 30 \
   --load_to_ram

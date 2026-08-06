@@ -371,8 +371,8 @@ def main():
     ap.add_argument("--cache_jobs", type=int, default=32)
 
     # --- Training objective / optimization schedule ---
-    ap.add_argument("--loss_type", choices=["bce", "focal"], default="focal",
-                    help="'focal' (default, used for the reported results) or plain 'bce'.")
+    ap.add_argument("--loss_type", choices=["bce", "focal"], default="bce",
+                    help="'bce' (default; main results) or 'focal' (used for the leave-one-drug-out retrains).")
     ap.add_argument("--focal_gamma", type=float, default=2.0,
                     help="Focal-loss gamma (only used when --loss_type focal).")
     ap.add_argument("--pos_weight", default="auto",
