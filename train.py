@@ -9,13 +9,16 @@ import tqdm
 import joblib
 from joblib import Parallel, delayed
 
+import math
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch_geometric.data import Batch as PYGBatch
 from torch_scatter import scatter_add
+from sklearn.metrics import roc_auc_score
 
 
 # -----------------------------
@@ -314,6 +317,38 @@ def eval_acc(model, loader, device):
     return correct / max(total, 1)
 
 
+@torch.no_grad()
+def eval_metrics(model, loader, device):
+    """Return (accuracy, AUROC) on a loader. AUROC is threshold-free."""
+    model.eval()
+    correct, total = 0, 0
+    all_probs, all_labels = [], []
+    for drug_ids, drug_kpm, prot_batch, bg_index, pm_BG, y in loader:
+        drug_ids, drug_kpm = drug_ids.to(device, non_blocking=True), drug_kpm.to(device, non_blocking=True)
+        pm_BG, y = pm_BG.to(device, non_blocking=True), y.to(device, non_blocking=True)
+        if prot_batch: prot_batch = prot_batch.to(device)
+        if bg_index is not None: bg_index = bg_index.to(device, non_blocking=True)
+        logits, _ = model(drug_ids, drug_kpm, prot_batch, bg_index, pm_BG)
+        probs = torch.sigmoid(logits)
+        correct += ((probs >= 0.5).float() == y).sum().item()
+        total += y.numel()
+        all_probs.append(probs.flatten().cpu().numpy())
+        all_labels.append(y.flatten().cpu().numpy())
+    acc = correct / max(total, 1)
+    yb = np.concatenate(all_probs); yt = np.concatenate(all_labels).astype(int)
+    auroc = roc_auc_score(yt, yb) if 0 < yt.sum() < len(yt) else float("nan")
+    return acc, auroc
+
+
+def focal_bce_with_logits(logits, targets, pos_weight=None, gamma=2.0):
+    """Focal loss on top of binary cross-entropy. gamma=0 reduces to weighted BCE."""
+    bce = F.binary_cross_entropy_with_logits(
+        logits, targets, pos_weight=pos_weight, reduction="none")
+    p = torch.sigmoid(logits)
+    p_t = p * targets + (1 - p) * (1 - targets)      # prob of the true class
+    return ((1 - p_t) ** gamma * bce).mean()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cache_root", required=True)
@@ -334,6 +369,21 @@ def main():
     ap.add_argument("--grad_accum_steps", type=int, default=1)
     ap.add_argument("--load_to_ram", action="store_true")
     ap.add_argument("--cache_jobs", type=int, default=32)
+
+    # --- Training objective / optimization schedule ---
+    ap.add_argument("--loss_type", choices=["bce", "focal"], default="focal",
+                    help="'focal' (default, used for the reported results) or plain 'bce'.")
+    ap.add_argument("--focal_gamma", type=float, default=2.0,
+                    help="Focal-loss gamma (only used when --loss_type focal).")
+    ap.add_argument("--pos_weight", default="auto",
+                    help="'auto' = n_neg/n_pos from the training labels, 'none', or a float.")
+    ap.add_argument("--lr_schedule", choices=["cosine", "none"], default="cosine",
+                    help="Cosine decay with linear warm-up (default) or constant LR.")
+    ap.add_argument("--warmup_epochs", type=int, default=5)
+    ap.add_argument("--best_metric", choices=["auroc", "acc"], default="auroc",
+                    help="Validation metric used for checkpoint selection / early stopping.")
+    ap.add_argument("--patience", type=int, default=30,
+                    help="Early-stopping patience in epochs (on --best_metric).")
 
     args = ap.parse_args()
     set_seed(args.seed)
@@ -380,12 +430,35 @@ def main():
 
     model = AMRPredictor(tokenizer.vocab_size, args.n_genes).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
-    loss_fn = nn.BCEWithLogitsLoss()
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
 
-    best_val = -1.0
+    # Positive-class weighting for the imbalanced R/S labels.
+    if args.pos_weight == "auto":
+        n_pos = float((train_df["label"] == 1).sum())
+        n_neg = float((train_df["label"] == 0).sum())
+        pw = torch.tensor([max(n_neg, 1.0) / max(n_pos, 1.0)], device=device)
+    elif args.pos_weight == "none":
+        pw = None
+    else:
+        pw = torch.tensor([float(args.pos_weight)], device=device)
 
-    print(f"Training Start. Steps per epoch: {len(train_loader)}")
+    # Cosine learning-rate schedule with linear warm-up (per epoch).
+    if args.lr_schedule == "cosine":
+        def lr_lambda(ep_idx):
+            if ep_idx < args.warmup_epochs:
+                return (ep_idx + 1) / max(1, args.warmup_epochs)
+            progress = (ep_idx - args.warmup_epochs) / max(1, args.epochs - args.warmup_epochs)
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+        scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+    else:
+        scheduler = None
+
+    best_val = -1.0
+    epochs_no_improve = 0
+
+    print(f"Training Start. Steps per epoch: {len(train_loader)}  "
+          f"loss={args.loss_type} (gamma={args.focal_gamma}), "
+          f"select={args.best_metric}, patience={args.patience}")
 
     for ep in range(1, args.epochs + 1):
         model.train()
@@ -401,7 +474,11 @@ def main():
 
             with torch.cuda.amp.autocast(enabled=args.amp):
                 logits, _ = model(drug_ids, drug_kpm, prot_batch, bg_index, pm_BG)
-                loss = loss_fn(logits, y) / args.grad_accum_steps
+                if args.loss_type == "focal":
+                    loss = focal_bce_with_logits(logits, y, pos_weight=pw, gamma=args.focal_gamma)
+                else:
+                    loss = F.binary_cross_entropy_with_logits(logits, y, pos_weight=pw)
+                loss = loss / args.grad_accum_steps
 
             scaler.scale(loss).backward()
             total_loss += loss.item() * args.grad_accum_steps
@@ -421,14 +498,28 @@ def main():
             pbar.set_postfix(loss=f"{loss.item() * args.grad_accum_steps:.4f}")
 
         train_acc = correct / max(total, 1)
-        val_acc = eval_acc(model, val_loader, device)
+        val_acc, val_auroc = eval_metrics(model, val_loader, device)
         avg_loss = total_loss / len(train_loader)
 
-        print(f"[Epoch {ep}] Loss={avg_loss:.4f} TrainAcc={train_acc:.4f} ValAcc={val_acc:.4f}")
+        if scheduler is not None:
+            scheduler.step()
 
-        if val_acc > best_val:
-            best_val = val_acc
+        cur = val_auroc if args.best_metric == "auroc" else val_acc
+        lr_now = opt.param_groups[0]["lr"]
+        print(f"[Epoch {ep}] Loss={avg_loss:.4f} TrainAcc={train_acc:.4f} "
+              f"ValAcc={val_acc:.4f} ValAUROC={val_auroc:.4f} lr={lr_now:.2e}")
+
+        improved = (not math.isnan(cur)) and (cur > best_val)
+        if improved:
+            best_val = cur
+            epochs_no_improve = 0
             torch.save(model.state_dict(), out_dir / "best.pt")
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= args.patience:
+                print(f"[EarlyStop] no improvement in {args.best_metric} "
+                      f"for {args.patience} epochs; stopping at epoch {ep}.")
+                break
 
 
 if __name__ == "__main__":
