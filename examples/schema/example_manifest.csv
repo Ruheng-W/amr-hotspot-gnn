@@ -1,0 +1,5 @@
+sample_id,drug_name,drug_smiles,label,pt_path
+isolate_0001,ampicillin,CC1(C)S[C@@H]2[C@H](NC(=O)[C@H](N)c3ccccc3)C(=O)N2[C@H]1C(=O)O,1,graphs/isolate_0001.pt
+isolate_0001,ciprofloxacin,O=C(O)c1cn(C2CC2)c2cc(N3CCNCC3)c(F)cc2c1=O,0,graphs/isolate_0001.pt
+isolate_0002,ampicillin,CC1(C)S[C@@H]2[C@H](NC(=O)[C@H](N)c3ccccc3)C(=O)N2[C@H]1C(=O)O,0,graphs/isolate_0002.pt
+isolate_0002,ciprofloxacin,O=C(O)c1cn(C2CC2)c2cc(N3CCNCC3)c(F)cc2c1=O,1,graphs/isolate_0002.pt

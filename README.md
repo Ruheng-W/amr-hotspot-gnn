@@ -139,3 +139,10 @@ Builds the lineage-aware PATRIC split from whole-genome unitig profiles
 
 build_species_split_antibiogram.py
 Builds the leave-species-out Antibiogram split (whole species held out for test)
+
+## Examples
+
+See [`examples/`](examples/) for small, self-contained input/output examples:
+a fully runnable hotspot-detection example (public PDB 1UBQ), plus schema
+files documenting the training manifest and interpretability panel-map formats.
+No patient-derived data is included.
